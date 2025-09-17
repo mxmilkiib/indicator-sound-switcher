@@ -1,12 +1,17 @@
 import os.path
 import logging
 import time
-import pkg_resources
+import re
+try:
+    from importlib.metadata import version as _pkg_version, PackageNotFoundError as _PkgNotFound
+except Exception:  # pragma: no cover - very old python
+    _pkg_version = None
+    _PkgNotFound = Exception
 
 import gi
 
 gi.require_version('Gtk', '3.0')
-from gi.repository import GObject, Gtk, GLib
+from gi.repository import GObject, Gtk, GLib, Gio, GdkPixbuf
 
 try:
     gi.require_version('AyatanaAppIndicator3', '0.1')
@@ -38,7 +43,25 @@ You should have received a copy of the GNU General Public License along
 with this program. If not, see http://www.gnu.org/licenses/"""
 
 # Determine app version
-APP_VERSION = pkg_resources.require(APP_ID)[0].version
+# old call kept for context:
+# APP_VERSION = pkg_resources.require(APP_ID)[0].version
+APP_VERSION = 'dev'
+if _pkg_version:
+    try:
+        APP_VERSION = _pkg_version(APP_ID)
+    except _PkgNotFound:
+        pass
+if APP_VERSION == 'dev':
+    # fallback for running from a source tree without installation
+    try:
+        setup_py = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'setup.py'))
+        if os.path.isfile(setup_py):
+            with open(setup_py, 'r', encoding='utf-8') as fh:
+                m = re.search(r"APP_VERSION\s*=\s*'([^']+)'", fh.read())
+                if m:
+                    APP_VERSION = m.group(1)
+    except Exception:
+        pass
 
 YESNO = {False: 'No', True: 'Yes'}
 
@@ -56,12 +79,15 @@ class SoundSwitcherIndicator(GObject.GObject):
         """Constructor."""
         GObject.GObject.__init__(self)
 
-        # Create the indicator object
+        # create the indicator object
+        # old icon init (kept for reference): self.ind = AppIndicator.Indicator.new(APP_ID, 'indicator-sound-switcher-symbolic', AppIndicator.IndicatorCategory.HARDWARE)
+        # new: start neutral; icon_refresh() will pick best variant
         self.ind = AppIndicator.Indicator.new(
             APP_ID,
-            'indicator-sound-switcher-symbolic',
+            'indicator-sound-switcher',
             AppIndicator.IndicatorCategory.HARDWARE)
-        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        # start passive; we'll flip to ACTIVE after picking the icon to avoid cached black icons
+        self.ind.set_status(AppIndicator.IndicatorStatus.PASSIVE)
 
         # Initialise PulseAudio object lists and references
         self.cards          = {}
@@ -98,6 +124,16 @@ class SoundSwitcherIndicator(GObject.GObject):
         self.keyboard_manager = KeyboardManager(self.on_port_keyboard_shortcut)
         self.keyboard_manager.bind_keys(self.config)
 
+        # set icon adaptively and watch theme changes
+        self.icon_refresh()
+        # now go active so hosts pick up the correct icon name/theme on first exposure
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.connect('notify::gtk-theme-name', self._on_theme_changed)
+            settings.connect('notify::gtk-application-prefer-dark-theme', self._on_theme_changed)
+            settings.connect('notify::gtk-icon-theme-name', self._on_theme_changed)
+
         # Create a menu
         self.menu = Gtk.Menu()
         self.ind.set_menu(self.menu)
@@ -119,6 +155,221 @@ class SoundSwitcherIndicator(GObject.GObject):
 
         # Connect to the daemon, this will also refill the menu
         self.pulseaudio_connect()
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # icon/theme helpers
+    # strategy:
+    # - on GNOME-family desktops, use the symbolic icon name and let the theme recolour it.
+    # - elsewhere (e.g. awesomewm), recolour our SVG to a contrasting light/dark tone,
+    #   write it under ~/.cache/indicator-sound-switcher/icons/hicolor/scalable/status/ and use it via set_icon_full.
+    # env overrides for troubleshooting and theming:
+    #   ISS_PREFER_DARK / INDICATOR_SOUND_SWITCHER_PREFER_DARK = 1|0 (force dark|light)
+    #   ISS_FORCE_SYMBOLIC = 1 (force symbolic path)
+    #   ISS_FORCE_FILE_ICON / INDICATOR_SOUND_SWITCHER_FORCE_FILE_ICON = 1 (force file path)
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def _on_theme_changed(self, *args):
+        """theme setting changed -> refresh icon on idle."""
+        GLib.idle_add(self.icon_refresh)
+
+    def _is_gnome_family(self) -> bool:
+        """heuristic check for desktops that recolour symbolic icons (gnome-family).
+        returns True for gnome/unity/budgie/pantheon/cinnamon unless explicitly matched to other WMs.
+        """
+        desk = '{}:{}:{}:{}'.format(
+            os.environ.get('XDG_CURRENT_DESKTOP', ''),
+            os.environ.get('DESKTOP_SESSION', ''),
+            os.environ.get('GNOME_SESSION_XDG_SESSION_PATH', ''),
+            os.environ.get('XDG_SESSION_DESKTOP', ''),
+        ).lower()
+        # explicit opt-out for known non-gnome wms/desktops
+        if any(x in desk for x in ['awesome', 'i3', 'sway', 'xmonad', 'openbox', 'fluxbox', 'plasma', 'kde', 'lxqt', 'xfce', 'mate']):
+            return False
+        for token in ['gnome', 'unity', 'ubuntu:gnome', 'budgie', 'pantheon', 'cinnamon']:
+            if token in desk:
+                return True
+        return False
+
+    def _prefer_dark(self) -> bool:
+        """guess if ui prefers dark; explicit signals win; defaults to dark.
+        honours env overrides first, then gsettings (org.gnome.desktop.interface color-scheme),
+        gtk settings, GTK_THEME and common Qt env hints.
+        """
+        # explicit env overrides first
+        env_force = os.environ.get('ISS_PREFER_DARK') or os.environ.get('INDICATOR_SOUND_SWITCHER_PREFER_DARK')
+        if env_force is not None:
+            val = str(env_force).strip().lower()
+            if val in {'1', 'true', 'yes', 'y', 'dark'}:
+                return True
+            if val in {'0', 'false', 'no', 'n', 'light'}:
+                return False
+        # gsettings (gnome family)
+        try:
+            iface = Gio.Settings.new('org.gnome.desktop.interface')
+            try:
+                scheme = iface.get_string('color-scheme')  # 'default' or 'prefer-dark'
+                if scheme:
+                    return scheme == 'prefer-dark'
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # gtk settings
+        try:
+            settings = Gtk.Settings.get_default()
+            if settings is not None:
+                try:
+                    if settings.get_property('gtk-application-prefer-dark-theme'):
+                        return True
+                except Exception:
+                    pass
+                try:
+                    theme_name = settings.get_property('gtk-theme-name') or ''
+                    if 'dark' in theme_name.lower():
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # env override
+        env_theme = os.environ.get('GTK_THEME', '')
+        if 'dark' in env_theme.lower():
+            return True
+        if 'light' in env_theme.lower():
+            return False
+        # common Qt envs
+        for env_qt in ['QT_STYLE_OVERRIDE', 'QT_QUICK_CONTROLS_STYLE', 'QT_QPA_PLATFORMTHEME']:
+            v = os.environ.get(env_qt, '')
+            if 'dark' in v.lower():
+                return True
+        return True
+
+    def _get_base_svg(self) -> str:
+        """resolve the base symbolic svg text.
+        tries current icon theme first; falls back to the in-tree icons/indicator-sound-switcher-symbolic.svg.
+        returns SVG text or None.
+        """
+        # theme lookup
+        try:
+            theme = Gtk.IconTheme.get_default()
+            info = theme.lookup_icon('indicator-sound-switcher-symbolic', 24, 0)
+            if info:
+                path = info.get_filename()
+                if path and path.endswith('.svg') and os.path.isfile(path):
+                    with open(path, 'r', encoding='utf-8') as fh:
+                        return fh.read()
+        except Exception:
+            pass
+        # repo fallback (useful from source tree)
+        local_path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), '..', '..', 'icons', 'indicator-sound-switcher-symbolic.svg'))
+        try:
+            if os.path.isfile(local_path):
+                with open(local_path, 'r', encoding='utf-8') as fh:
+                    return fh.read()
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _recolor_svg(svg_text: str, color: str) -> str:
+        """replace common fill/stroke colours in an svg string with the desired color."""
+        if not svg_text:
+            return svg_text
+        # cover both attribute and css styles
+        svg_text = re.sub(r'fill\s*=\s*"#[0-9A-Fa-f]{3,6}"', f'fill="{color}"', svg_text)
+        svg_text = re.sub(r'fill\s*:\s*#[0-9A-Fa-f]{3,6}',    f'fill:{color}', svg_text)
+        svg_text = re.sub(r'stroke\s*=\s*"#[0-9A-Fa-f]{3,6}"', f'stroke="{color}"', svg_text)
+        svg_text = re.sub(r'stroke\s*:\s*#[0-9A-Fa-f]{3,6}',    f'stroke:{color}', svg_text)
+        return svg_text
+
+    def icon_refresh(self):
+        """pick and apply an icon that fits the current theme and desktop.
+        on gnome-family: use 'indicator-sound-switcher-symbolic'.
+        otherwise: recolour svg and set via absolute file path (with png fallback).
+        """
+        # allow env to force a particular path for troubleshooting
+        env_force_file = os.environ.get('ISS_FORCE_FILE_ICON') or os.environ.get('INDICATOR_SOUND_SWITCHER_FORCE_FILE_ICON')
+        env_force_symbolic = os.environ.get('ISS_FORCE_SYMBOLIC') or os.environ.get('INDICATOR_SOUND_SWITCHER_FORCE_SYMBOLIC')
+        try:
+            if (env_force_symbolic and str(env_force_symbolic).strip().lower() in {'1','true','yes','y'}) or \
+               (not env_force_file and self._is_gnome_family()):
+                logging.debug('icon: using symbolic icon from theme (gnome family or forced)')
+                # rely on theme recolouring of symbolic icons
+                try:
+                    self.ind.set_icon_theme_path(None)
+                except Exception:
+                    pass
+                self.ind.set_icon('indicator-sound-switcher-symbolic')
+                return
+        except Exception as e:
+            logging.debug('icon: gnome-detect failed: %s', e)
+
+        # non-gnome: generate white/near-black svg and point indicator to a small cache dir
+        prefer_dark = self._prefer_dark()
+        fg = '#ffffff' if prefer_dark else '#111111'
+        svg = self._get_base_svg()
+        if not svg:
+            # last resort: still use the symbolic name
+            self.ind.set_icon('indicator-sound-switcher-symbolic')
+            return
+        svg = self._recolor_svg(svg, fg)
+        cache_dir = os.path.join(GLib.get_user_cache_dir(), APP_ID, 'icons')
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            pass
+        # use a hicolor-like layout so Gtk.IconTheme can find it reliably
+        theme_base = os.path.join(cache_dir, 'hicolor')
+        out_dir = os.path.join(theme_base, 'scalable', 'status')
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+        # unique name to avoid collisions with system icons
+        out_path = os.path.join(out_dir, 'indicator-sound-switcher-generated.svg')
+        try:
+            need_write = True
+            try:
+                with open(out_path, 'r', encoding='utf-8') as fh:
+                    need_write = fh.read() != svg
+            except Exception:
+                pass
+            if need_write:
+                with open(out_path, 'w', encoding='utf-8') as fh:
+                    fh.write(svg)
+        except Exception as e:
+            logging.debug('icon cache write failed: %s', e)
+        # generate a small png fallback for trays that don't render svg from paths
+        png_path = os.path.join(out_dir, 'indicator-sound-switcher-generated-48.png')
+        path_to_use = out_path
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(out_path, 48, 48, True)
+            pb.savev(png_path, 'png', [], [])
+            path_to_use = png_path
+            logging.debug('icon: generated png fallback at %s', png_path)
+        except Exception as e:
+            logging.debug('icon: png fallback generation failed: %s', e)
+
+        # prefer absolute path if supported by the binding; otherwise fallback to theme path + name
+        used_full = False
+        try:
+            if hasattr(self.ind, 'set_icon_full') and callable(self.ind.set_icon_full):
+                self.ind.set_icon_full(path_to_use, 'Sound Switcher Indicator')
+                used_full = True
+                logging.debug('icon: set via set_icon_full(%s)', path_to_use)
+        except Exception as e:
+            logging.debug('icon: set_icon_full failed: %s', e)
+        if not used_full:
+            try:
+                # point appindicator to the hicolor base we just wrote
+                self.ind.set_icon_theme_path(theme_base)
+            except Exception:
+                pass
+            self.ind.set_icon('indicator-sound-switcher-generated')
+            logging.debug('icon: file variant set from %s (prefer_dark=%s, theme_base=%s)', out_path, prefer_dark, theme_base)
 
     # ------------------------------------------------------------------------------------------------------------------
     # Signal handlers
